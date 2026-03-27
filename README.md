@@ -632,6 +632,9 @@ npm install && npm run dev
 
 ### API Endpoints
 
+See [saved voices and streamed speech](docs/saved-voices.md) for persistent voice
+cloning, continuous audio responses, and OpenClaw configuration.
+
 **Text-to-Speech** (OpenAI-compatible):
 ```bash
 curl -X POST http://localhost:8000/v1/audio/speech \

@@ -2,6 +2,7 @@ import functools
 import io
 import json
 import queue
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -18,8 +19,10 @@ pytest.importorskip("multipart", reason="python-multipart is required for server
 
 from fastapi.testclient import TestClient
 
+import mlx_audio.server as server_module
 from mlx_audio.server import _stream_inference_results, app
 from mlx_audio.server_inference import InferenceResultChunk
+from mlx_audio.voice_registry import VoiceRegistry
 
 
 @pytest.fixture
@@ -35,6 +38,13 @@ def mock_model_provider():
     ) as mock_provider:
         mock_provider.load_model = MagicMock()
         yield mock_provider
+
+
+@pytest.fixture
+def isolated_voice_registry(tmp_path, monkeypatch):
+    registry = VoiceRegistry(tmp_path / "voices")
+    monkeypatch.setattr(server_module, "voice_registry", registry)
+    return registry
 
 
 def test_list_models_empty(client, mock_model_provider):
@@ -221,6 +231,350 @@ def test_stt_transcriptions_bad_model_returns_404(client, mock_model_provider):
     body = response.json()
     assert "detail" in body
     assert "does-not-exist-on-hf" in body["detail"]
+
+
+def test_create_voice_persists_uploaded_audio(
+    client, mock_model_provider, isolated_voice_registry
+):
+    sample_rate = 16000
+    duration = 1
+    frequency = 440
+    t = np.linspace(0, duration, int(sample_rate * duration), False)
+    audio_data = 0.5 * np.sin(2 * np.pi * frequency * t).astype(np.float32)
+
+    buffer = io.BytesIO()
+    audio_write(buffer, audio_data, sample_rate, format="wav")
+    buffer.seek(0)
+
+    response = client.post(
+        "/v1/audio/voices",
+        files={"audio_sample": ("sample.wav", buffer, "audio/x-wav")},
+        data={"name": "Narrator", "consent": "cons_1234"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "audio.voice"
+    assert data["id"] == "Narrator"
+    assert data["name"] == "Narrator"
+
+    voice_id = data["id"]
+    saved_voice = isolated_voice_registry.get_voice(voice_id)
+    sample_path = isolated_voice_registry.get_audio_sample_path(voice_id)
+
+    assert saved_voice["consent"] == "cons_1234"
+    assert sample_path.exists()
+    assert sample_path.read_bytes()
+
+
+def test_create_voice_persists_transcript(
+    client, mock_model_provider, isolated_voice_registry
+):
+    sample_rate = 16000
+    duration = 1
+    frequency = 440
+    t = np.linspace(0, duration, int(sample_rate * duration), False)
+    audio_data = 0.5 * np.sin(2 * np.pi * frequency * t).astype(np.float32)
+
+    buffer = io.BytesIO()
+    audio_write(buffer, audio_data, sample_rate, format="wav")
+    buffer.seek(0)
+
+    response = client.post(
+        "/v1/audio/voices",
+        files={"audio_sample": ("sample.wav", buffer, "audio/x-wav")},
+        data={
+            "name": "NarratorWithText",
+            "consent": "cons_1234",
+            "transcript": "Reference transcript",
+        },
+    )
+
+    assert response.status_code == 200
+    saved_voice = isolated_voice_registry.get_voice("NarratorWithText")
+    assert saved_voice["transcript"] == "Reference transcript"
+
+
+def test_create_voice_rejects_duplicate_name(
+    client, mock_model_provider, isolated_voice_registry
+):
+    sample_rate = 16000
+    duration = 1
+    frequency = 440
+    t = np.linspace(0, duration, int(sample_rate * duration), False)
+    audio_data = 0.5 * np.sin(2 * np.pi * frequency * t).astype(np.float32)
+
+    def post_voice():
+        buffer = io.BytesIO()
+        audio_write(buffer, audio_data, sample_rate, format="wav")
+        buffer.seek(0)
+        return client.post(
+            "/v1/audio/voices",
+            files={"audio_sample": ("sample.wav", buffer, "audio/x-wav")},
+            data={"name": "ai", "consent": "cons_1234"},
+        )
+
+    first = post_voice()
+    second = post_voice()
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert "already exists" in second.json()["detail"]
+
+
+def test_list_voices_returns_uploaded_voice_names(
+    client, mock_model_provider, isolated_voice_registry
+):
+    isolated_voice_registry.create_voice(
+        name="beta",
+        consent="cons_1",
+        audio_bytes=b"beta",
+        filename="beta.wav",
+        content_type="audio/x-wav",
+    )
+    isolated_voice_registry.create_voice(
+        name="ai",
+        consent="cons_2",
+        audio_bytes=b"ai",
+        filename="ai.wav",
+        content_type="audio/x-wav",
+    )
+
+    response = client.get("/v1/audio/voices")
+
+    assert response.status_code == 200
+    assert response.json() == {"voices": ["ai", "beta"]}
+
+
+def test_delete_voice_deletes_uploaded_voice(
+    client, mock_model_provider, isolated_voice_registry
+):
+    isolated_voice_registry.create_voice(
+        name="ai",
+        consent="cons_1",
+        audio_bytes=b"ai",
+        filename="ai.wav",
+        content_type="audio/x-wav",
+    )
+
+    response = client.delete("/v1/audio/voices/ai")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "message": "Voice 'ai' deleted successfully",
+    }
+    assert isolated_voice_registry.resolve_voice("ai") is None
+
+
+def test_delete_voice_supports_legacy_name_lookup(
+    client, mock_model_provider, isolated_voice_registry
+):
+    legacy_id = "legacy_voice_id"
+    voice_dir = isolated_voice_registry.root / legacy_id
+    voice_dir.mkdir(parents=True, exist_ok=True)
+    sample_name = "audio_sample.wav"
+    (voice_dir / sample_name).write_bytes(b"legacy")
+    isolated_voice_registry._write_metadata(
+        legacy_id,
+        {
+            "id": legacy_id,
+            "object": "audio.voice",
+            "created_at": 0,
+            "name": "legacy-ai",
+            "consent": "cons_legacy",
+            "audio_sample_filename": sample_name,
+            "audio_sample_mime_type": "audio/x-wav",
+            "audio_sample_path": sample_name,
+            "transcript": None,
+            "transcript_model": None,
+        },
+    )
+
+    response = client.delete("/v1/audio/voices/legacy-ai")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "message": "Voice 'legacy-ai' deleted successfully",
+    }
+    assert not voice_dir.exists()
+
+
+def test_tts_speech_with_saved_qwen_voice_reuses_cached_speaker_prompt(
+    client, mock_model_provider, isolated_voice_registry
+):
+    sample_rate = 16000
+    duration = 1
+    frequency = 330
+    t = np.linspace(0, duration, int(sample_rate * duration), False)
+    audio_data = 0.5 * np.sin(2 * np.pi * frequency * t).astype(np.float32)
+
+    buffer = io.BytesIO()
+    audio_write(buffer, audio_data, sample_rate, format="wav")
+    voice = isolated_voice_registry.create_voice(
+        name="Cloned Narrator",
+        consent="cons_5678",
+        audio_bytes=buffer.getvalue(),
+        filename="voice.wav",
+        content_type="audio/x-wav",
+    )
+
+    prompt = {
+        "speaker_embedding": mx.array(np.ones((1, 256), dtype=np.float32)),
+    }
+    mock_tts_model = MagicMock()
+    mock_tts_model.model_type = "qwen3_tts"
+    mock_tts_model.config = SimpleNamespace(tts_model_type="base")
+    mock_tts_model.sample_rate = sample_rate
+    mock_tts_model.create_voice_clone_prompt = MagicMock(return_value=prompt)
+    mock_tts_model.generate = MagicMock(wraps=sync_mock_audio_stream_generator)
+
+    def load_model_side_effect(model_name):
+        if model_name == "test_qwen_model":
+            return mock_tts_model
+        raise AssertionError(f"Unexpected model load: {model_name}")
+
+    mock_model_provider.load_model = MagicMock(side_effect=load_model_side_effect)
+
+    payload = {
+        "model": "test_qwen_model",
+        "input": "Hello world",
+        "voice": {"id": voice["id"]},
+    }
+
+    first_response = client.post("/v1/audio/speech", json=payload)
+    second_response = client.post("/v1/audio/speech", json=payload)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert mock_tts_model.create_voice_clone_prompt.call_count == 1
+    assert mock_tts_model.generate.call_count == 2
+
+    first_call = mock_tts_model.generate.call_args_list[0]
+    assert first_call.args[0] == payload["input"]
+    assert first_call.kwargs["voice"] is None
+    assert first_call.kwargs["ref_audio"] is None
+    assert first_call.kwargs["ref_text"] is None
+    assert first_call.kwargs["voice_clone_prompt"] is not None
+
+    voice_meta = isolated_voice_registry.get_voice(voice["id"])
+    cache_path = isolated_voice_registry.get_prompt_cache_path(
+        voice["id"], payload["model"]
+    )
+    assert voice_meta["transcript"] is None
+    assert cache_path.exists()
+
+
+def test_tts_speech_with_saved_qwen_voice_uses_uploaded_ref_text(
+    client, mock_model_provider, isolated_voice_registry
+):
+    sample_rate = 16000
+    duration = 1
+    frequency = 330
+    t = np.linspace(0, duration, int(sample_rate * duration), False)
+    audio_data = 0.5 * np.sin(2 * np.pi * frequency * t).astype(np.float32)
+
+    buffer = io.BytesIO()
+    audio_write(buffer, audio_data, sample_rate, format="wav")
+    voice = isolated_voice_registry.create_voice(
+        name="Cloned Narrator With Text",
+        consent="cons_5678",
+        audio_bytes=buffer.getvalue(),
+        filename="voice.wav",
+        content_type="audio/x-wav",
+        transcript="Uploaded reference text",
+    )
+
+    prompt = {
+        "ref_codes": mx.array(np.ones((1, 16, 4), dtype=np.int32)),
+        "ref_text_ids": mx.array(np.array([[1, 2, 3]], dtype=np.int32)),
+        "speaker_embedding": mx.array(np.ones((1, 256), dtype=np.float32)),
+    }
+    mock_tts_model = MagicMock()
+    mock_tts_model.model_type = "qwen3_tts"
+    mock_tts_model.config = SimpleNamespace(tts_model_type="base")
+    mock_tts_model.sample_rate = sample_rate
+    mock_tts_model.create_voice_clone_prompt = MagicMock(return_value=prompt)
+    mock_tts_model.generate = MagicMock(wraps=sync_mock_audio_stream_generator)
+    mock_model_provider.load_model = MagicMock(return_value=mock_tts_model)
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "test_qwen_model",
+            "input": "Hello world",
+            "voice": {"id": voice["id"]},
+        },
+    )
+
+    assert response.status_code == 200
+    mock_tts_model.create_voice_clone_prompt.assert_called_once()
+    assert mock_tts_model.create_voice_clone_prompt.call_args.kwargs["ref_text"] == (
+        "Uploaded reference text"
+    )
+
+
+def test_tts_speech_with_saved_voice_string_name_lookup(
+    client, mock_model_provider, isolated_voice_registry
+):
+    sample_rate = 16000
+    duration = 1
+    frequency = 330
+    t = np.linspace(0, duration, int(sample_rate * duration), False)
+    audio_data = 0.5 * np.sin(2 * np.pi * frequency * t).astype(np.float32)
+
+    legacy_id = "legacy_voice_id"
+    voice_dir = isolated_voice_registry.root / legacy_id
+    voice_dir.mkdir(parents=True, exist_ok=True)
+    sample_name = "audio_sample.wav"
+    sample_path = voice_dir / sample_name
+    buffer = io.BytesIO()
+    audio_write(buffer, audio_data, sample_rate, format="wav")
+    sample_path.write_bytes(buffer.getvalue())
+    isolated_voice_registry._write_metadata(
+        legacy_id,
+        {
+            "id": legacy_id,
+            "object": "audio.voice",
+            "created_at": 0,
+            "name": "legacy-ai",
+            "consent": "cons_legacy",
+            "audio_sample_filename": sample_name,
+            "audio_sample_mime_type": "audio/x-wav",
+            "audio_sample_path": sample_name,
+            "transcript": None,
+            "transcript_model": None,
+        },
+    )
+
+    prompt = {
+        "speaker_embedding": mx.array(np.ones((1, 256), dtype=np.float32)),
+    }
+    mock_tts_model = MagicMock()
+    mock_tts_model.model_type = "qwen3_tts"
+    mock_tts_model.config = SimpleNamespace(tts_model_type="base")
+    mock_tts_model.sample_rate = sample_rate
+    mock_tts_model.create_voice_clone_prompt = MagicMock(return_value=prompt)
+    mock_tts_model.generate = MagicMock(wraps=sync_mock_audio_stream_generator)
+    mock_model_provider.load_model = MagicMock(return_value=mock_tts_model)
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "test_qwen_model",
+            "input": "Hello world",
+            "voice": "legacy-ai",
+        },
+    )
+
+    assert response.status_code == 200
+    first_call = mock_tts_model.generate.call_args
+    assert first_call.kwargs["voice"] is None
+    assert first_call.kwargs["voice_clone_prompt"] is not None
+    assert isolated_voice_registry.get_prompt_cache_path(
+        legacy_id, "test_qwen_model"
+    ).exists()
 
 
 def test_stt_transcriptions(client, mock_model_provider):

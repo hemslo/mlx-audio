@@ -59,8 +59,18 @@ from mlx_audio.server_inference import (
     InferenceRequest,
     InferenceResultChunk,
 )
+from mlx_audio.speech_stream import (
+    AudioChunk,
+    encode_audio_stream,
+    validate_audio_format,
+)
 from mlx_audio.tts.continuous import TTSBatchItem, TTSBatchOptions
 from mlx_audio.utils import load_model
+from mlx_audio.voice_registry import (
+    SUPPORTED_VOICE_SAMPLE_MIME_TYPES,
+    VOICE_SAMPLE_MAX_BYTES,
+    VoiceRegistry,
+)
 
 
 def sanitize_for_json(obj: Any) -> Any:
@@ -164,11 +174,15 @@ app.router.lifespan_context = app_lifespan
 
 
 # Request schemas for OpenAI-compatible endpoints
+class VoiceReference(BaseModel):
+    id: str
+
+
 class SpeechRequest(BaseModel):
     model: str
     input: str
     instruct: str | None = None
-    voice: str | None = None
+    voice: str | VoiceReference | None = None
     speed: float | None = 1.0
     gender: str | None = "male"
     pitch: float | None = 1.0
@@ -496,6 +510,8 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         continuous: bool,
     ) -> bool:
         speech_request: SpeechRequest = request.payload.request
+        if _get_custom_voice_id(speech_request.voice) is not None:
+            return False
         hook_name = (
             "supports_tts_continuous_batch" if continuous else "supports_tts_batch"
         )
@@ -604,6 +620,12 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         audio,
         sample_rate: int,
     ) -> None:
+        if speech_request.stream or speech_request.response_format == "pcm":
+            # Materialize on the inference worker; the HTTP encoder never touches MLX.
+            samples = np.array(audio, dtype=np.float32)
+            if samples.size:
+                request.emit_data(AudioChunk(samples, sample_rate))
+            return
         buffer = io.BytesIO()
         audio_write(
             buffer,
@@ -618,7 +640,9 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         speech_request = payload.request
         model = self._get_model_for_request(request)
 
-        ref_audio = speech_request.ref_audio
+        voice_name, ref_audio, ref_text, voice_clone_prompt = _resolve_saved_voice(
+            model, speech_request
+        )
         if ref_audio and isinstance(ref_audio, str):
             if not os.path.exists(ref_audio):
                 raise HTTPException(
@@ -638,14 +662,14 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         audio_chunks = []
         sample_rate = None
         generate_kwargs = {
-            "voice": speech_request.voice,
+            "voice": voice_name,
             "speed": speech_request.speed,
             "gender": speech_request.gender,
             "pitch": speech_request.pitch,
             "instruct": speech_request.instruct,
             "lang_code": speech_request.lang_code,
             "ref_audio": ref_audio,
-            "ref_text": speech_request.ref_text,
+            "ref_text": ref_text,
             "temperature": speech_request.temperature,
             "top_p": speech_request.top_p,
             "top_k": speech_request.top_k,
@@ -655,6 +679,9 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             "max_tokens": speech_request.max_tokens,
             "verbose": speech_request.verbose,
         }
+
+        if voice_clone_prompt is not None:
+            generate_kwargs["voice_clone_prompt"] = voice_clone_prompt
 
         for result in model.generate(speech_request.input, **generate_kwargs):
             if request.cancel_event.is_set():
@@ -898,6 +925,94 @@ async def _await_inference_result(handle: InferenceHandle):
         handle.cancel()
 
 
+voice_registry = VoiceRegistry.from_env()
+
+
+def _get_custom_voice_id(
+    voice: str | VoiceReference | None,
+) -> Optional[str]:
+    if isinstance(voice, VoiceReference):
+        metadata = voice_registry.resolve_voice(voice.id)
+        if metadata is None:
+            raise HTTPException(status_code=404, detail=f"Voice {voice.id!r} not found")
+        return metadata["id"]
+    if isinstance(voice, str):
+        metadata = voice_registry.resolve_voice(voice)
+        return metadata["id"] if metadata is not None else None
+    return None
+
+
+def _get_builtin_voice_name(
+    voice: str | VoiceReference | None,
+) -> Optional[str]:
+    if isinstance(voice, str) and voice_registry.resolve_voice(voice) is None:
+        return voice
+    return None
+
+
+def _supports_qwen3_voice_clone_cache(model: Any) -> bool:
+    return (
+        getattr(model, "model_type", None) == "qwen3_tts"
+        and getattr(getattr(model, "config", None), "tts_model_type", None) == "base"
+        and hasattr(model, "create_voice_clone_prompt")
+        and any(
+            parameter.name == "voice_clone_prompt"
+            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in inspect.signature(model.generate).parameters.values()
+        )
+    )
+
+
+def _resolve_saved_voice(
+    model: Any,
+    payload: SpeechRequest,
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[dict]]:
+    custom_voice_id = _get_custom_voice_id(payload.voice)
+    if custom_voice_id is None:
+        return (
+            _get_builtin_voice_name(payload.voice),
+            payload.ref_audio,
+            payload.ref_text,
+            None,
+        )
+
+    if payload.ref_audio is not None or payload.ref_text is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Saved voices cannot be combined with ref_audio or ref_text",
+        )
+
+    try:
+        voice = voice_registry.get_voice(custom_voice_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    ref_text = (voice.get("transcript") or "").strip() or None
+    ref_audio = str(voice_registry.get_audio_sample_path(custom_voice_id))
+    voice_clone_prompt = None
+
+    if _supports_qwen3_voice_clone_cache(model):
+        voice_clone_prompt = voice_registry.load_prompt_cache(
+            custom_voice_id, payload.model
+        )
+        if voice_clone_prompt is None:
+            try:
+                voice_clone_prompt = model.create_voice_clone_prompt(
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            voice_registry.store_prompt_cache(
+                custom_voice_id,
+                payload.model,
+                voice_clone_prompt,
+            )
+        ref_audio = None
+
+    return None, ref_audio, ref_text, voice_clone_prompt
+
+
 @app.get("/")
 async def root():
     return {
@@ -961,9 +1076,85 @@ async def remove_model(model_name: str):
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
 
 
+@app.post("/v1/audio/voices")
+async def create_voice(
+    audio_sample: UploadFile = File(...),
+    consent: str = Form(...),
+    name: str = Form(...),
+    transcript: Optional[str] = Form(None),
+):
+    """Create a persisted custom voice compatible with OpenAI's create voice API."""
+    content_type = (audio_sample.content_type or "").split(";", 1)[0].strip().lower()
+    if content_type and content_type not in SUPPORTED_VOICE_SAMPLE_MIME_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported audio_sample content type. "
+                f"Supported types: {sorted(SUPPORTED_VOICE_SAMPLE_MIME_TYPES)}"
+            ),
+        )
+
+    audio_bytes = await audio_sample.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="audio_sample cannot be empty")
+    if len(audio_bytes) > VOICE_SAMPLE_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"audio_sample exceeds the 10 MiB limit ({VOICE_SAMPLE_MAX_BYTES} bytes)",
+        )
+
+    try:
+        return voice_registry.create_voice(
+            name=name,
+            consent=consent,
+            audio_bytes=audio_bytes,
+            filename=audio_sample.filename,
+            content_type=content_type or None,
+            transcript=transcript,
+        )
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/v1/audio/voices/{name}")
+async def delete_voice(name: str):
+    """Delete an uploaded voice by id or saved name."""
+    try:
+        metadata = voice_registry.delete_voice(name)
+    except FileNotFoundError as exc:
+        return JSONResponse(
+            status_code=404,
+            content={"success": False, "error": str(exc)},
+        )
+
+    return {
+        "success": True,
+        "message": f"Voice '{metadata['name']}' deleted successfully",
+    }
+
+
 @app.post("/v1/audio/speech")
 async def tts_speech(payload: SpeechRequest, request: Request):
     """Generate speech audio following the OpenAI text-to-speech API."""
+    try:
+        validate_audio_format(payload.response_format)
+        custom_voice_id = _get_custom_voice_id(payload.voice)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if custom_voice_id is not None and (
+        payload.ref_audio is not None or payload.ref_text is not None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Saved voices cannot be combined with ref_audio or ref_text",
+        )
+    if custom_voice_id is not None:
+        # Keep explicit identity while queued, including if the voice is deleted.
+        payload = payload.model_copy(
+            update={"voice": VoiceReference(id=custom_voice_id)}
+        )
     if payload.ref_audio and isinstance(payload.ref_audio, str):
         if not os.path.exists(payload.ref_audio):
             raise HTTPException(
@@ -980,8 +1171,29 @@ async def tts_speech(payload: SpeechRequest, request: Request):
         normalized_kwargs=payload.model_dump(exclude={"model"}, exclude_none=True),
         stream=payload.stream,
     )
+    source = _stream_inference_results(handle, request)
+    encoded = encode_audio_stream(source, payload.response_format)
+    try:
+        first = await anext(encoded)
+    except StopAsyncIteration:
+        raise HTTPException(status_code=400, detail="No audio generated")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    async def body():
+        try:
+            yield first
+            async for chunk in encoded:
+                yield chunk
+        finally:
+            await encoded.aclose()
+            await source.aclose()
+            handle.cancel()
+
     return StreamingResponse(
-        _stream_inference_results(handle, request),
+        body(),
         media_type=f"audio/{payload.response_format}",
         headers={
             "Content-Disposition": f"attachment; filename=speech.{payload.response_format}"
@@ -1000,7 +1212,7 @@ async def tts_voices(model: Optional[str] = None):
     to whatever defaults make sense for that model.
     """
     if not model:
-        raise HTTPException(status_code=400, detail="model query parameter is required")
+        return {"voices": voice_registry.list_voice_names()}
 
     try:
         from huggingface_hub import snapshot_download

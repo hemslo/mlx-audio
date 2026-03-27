@@ -323,6 +323,65 @@ class Model(nn.Module):
 
         return speaker_embedding
 
+    def create_voice_clone_prompt(
+        self,
+        ref_audio: Union[str, mx.array],
+        ref_text: Optional[str] = None,
+    ) -> Dict[str, mx.array]:
+        """Build reusable prompt artifacts for Qwen3-TTS voice cloning.
+
+        The returned prompt can be cached and reused across multiple synthesis
+        calls so the reference audio only needs to be encoded once.
+        """
+        if getattr(self.config, "tts_model_type", "base") != "base":
+            raise ValueError(
+                "create_voice_clone_prompt is only supported by Qwen3-TTS base models"
+            )
+
+        if not isinstance(ref_audio, mx.array):
+            ref_audio = load_audio(ref_audio, sample_rate=self.sample_rate)
+
+        audio_for_spk = ref_audio
+        prompt = {}
+
+        if self.speaker_encoder is not None:
+            speaker_embedding = self.extract_speaker_embedding(audio_for_spk)
+            prompt["speaker_embedding"] = speaker_embedding
+
+        if ref_text:
+            if self.tokenizer is None:
+                raise ValueError("Tokenizer not loaded. Call post_load_hook first.")
+            if self.speech_tokenizer is None or not self.speech_tokenizer.has_encoder:
+                raise ValueError(
+                    "Speech tokenizer encoder is required for transcript-guided voice clone prompts"
+                )
+            # Keep upstream's in-memory cache for direct ref_audio callers too.
+            cache_key = (ref_text, (ref_audio.size, float(ref_audio.sum())))
+            cached = self._icl_cache.get(cache_key)
+            if cached is None:
+                if ref_audio.ndim == 1:
+                    ref_audio = ref_audio[None, None, :]
+                elif ref_audio.ndim == 2:
+                    ref_audio = ref_audio[None, :]
+                ref_codes = self.speech_tokenizer.encode(ref_audio)
+                ref_chat = f"<|im_start|>assistant\n{ref_text}<|im_end|>\n"
+                ref_ids = mx.array(self.tokenizer.encode(ref_chat))[None, :]
+                ref_text_ids = ref_ids[:, 3:-2]
+                mx.eval(ref_codes, ref_text_ids)
+                self._icl_cache[cache_key] = (ref_codes, ref_text_ids)
+            else:
+                ref_codes, ref_text_ids = cached
+
+            prompt["ref_codes"] = ref_codes
+            prompt["ref_text_ids"] = ref_text_ids
+
+        if not prompt:
+            raise ValueError(
+                "Voice clone prompt creation requires either a speaker encoder or transcript-guided tokenizer path"
+            )
+
+        return prompt
+
     def _prepare_generation_inputs(
         self,
         text: str,
@@ -330,6 +389,7 @@ class Model(nn.Module):
         speaker: Optional[str] = None,
         ref_audio: Optional[mx.array] = None,
         ref_text: Optional[str] = None,
+        speaker_embedding: Optional[mx.array] = None,
         instruct: Optional[str] = None,
     ) -> Tuple[mx.array, mx.array, mx.array]:
         """Prepare inputs for generation.
@@ -379,8 +439,10 @@ class Model(nn.Module):
         tts_pad_embed = tts_embeds[:, 2:3, :]
 
         # Speaker embedding
-        speaker_embed = None
-        if ref_audio is not None and self.speaker_encoder is not None:
+        speaker_embed = speaker_embedding
+        if speaker_embed is not None:
+            speaker_embed = mx.array(speaker_embed)
+        elif ref_audio is not None and self.speaker_encoder is not None:
             speaker_embed = self.extract_speaker_embedding(ref_audio)
         elif speaker and speaker.lower() in (config.spk_id or {}):
             spk_ids = mx.array([[config.spk_id[speaker.lower()]]])  # [1, 1]
@@ -610,58 +672,44 @@ class Model(nn.Module):
         ref_text: str,
         language: str = "auto",
     ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
+        voice_clone_prompt = self.create_voice_clone_prompt(
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+        )
+        return self._prepare_icl_generation_inputs_from_prompt(
+            text=text,
+            voice_clone_prompt=voice_clone_prompt,
+            language=language,
+        )
+
+    def _prepare_icl_generation_inputs_from_prompt(
+        self,
+        text: str,
+        voice_clone_prompt: Dict[str, mx.array],
+        language: str = "auto",
+    ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
         """Prepare inputs for ICL (In-Context Learning) voice cloning.
 
         Matches the official Qwen3-TTS generate_icl_prompt structure:
         1. text_embed = text_projection(text_embeddings(ref_text_tokens + target_text_tokens)) + eos
         2. codec_embed = codec_bos + sum_of_all_codebook_embeddings(ref_codes)
         3. Streaming overlay: text[:codec_len] + codec if text longer, else padded text + codec
-
-        Args:
-            text: Target text to synthesize
-            ref_audio: Reference audio waveform [samples]
-            ref_text: Transcript of the reference audio
-            language: Language code
-
-        Returns:
-            input_embeds: Input embeddings for prefill
-            trailing_text_hidden: Remaining text embeddings for generation
-            tts_pad_embed: Padding embedding
-            ref_codes: Reference codes [1, num_quantizers, ref_time]
         """
+
         if self.tokenizer is None:
             raise ValueError("Tokenizer not loaded. Call post_load_hook first.")
 
         config = self.config.talker_config
 
-        ref_codes = None
-        ref_text_ids = None
-        ref_audio_fingerprint = (ref_audio.size, float(ref_audio.sum()))
-        cache_key = (ref_text, ref_audio_fingerprint)
-        if cache_key in self._icl_cache:
-            ref_codes, ref_text_ids = self._icl_cache[cache_key]
-
-        # 1. Encode reference audio -> ref_codes [1, 16, ref_time]
-        audio_for_spk = ref_audio  # Save original shape for speaker embedding
-        if ref_codes is None:
-            if ref_audio.ndim == 1:
-                ref_audio = ref_audio[None, None, :]  # [1, 1, samples]
-            elif ref_audio.ndim == 2:
-                ref_audio = ref_audio[None, :]  # [1, 1, samples]
-            ref_codes = self.speech_tokenizer.encode(ref_audio)  # [1, 16, ref_time]
-            mx.eval(ref_codes)
-
-        # 2. Tokenize ref_text and target_text separately
-        # ref_text format: <|im_start|>assistant\n{ref_text}<|im_end|>\n
-        if ref_text_ids is None:
-            ref_chat = f"<|im_start|>assistant\n{ref_text}<|im_end|>\n"
-            ref_ids = mx.array(self.tokenizer.encode(ref_chat))[None, :]
-            # Pure ref text tokens: skip first 3 (role) and last 2 (<|im_end|>\n)
-            ref_text_ids = ref_ids[:, 3:-2]
-
-        if cache_key not in self._icl_cache:
-            mx.eval(ref_text_ids)
-            self._icl_cache[cache_key] = (ref_codes, ref_text_ids)
+        ref_codes = voice_clone_prompt["ref_codes"]
+        if not isinstance(ref_codes, mx.array):
+            ref_codes = mx.array(ref_codes)
+        ref_text_ids = voice_clone_prompt["ref_text_ids"]
+        if not isinstance(ref_text_ids, mx.array):
+            ref_text_ids = mx.array(ref_text_ids)
+        speaker_embed = voice_clone_prompt.get("speaker_embedding")
+        if speaker_embed is not None and not isinstance(speaker_embed, mx.array):
+            speaker_embed = mx.array(speaker_embed)
 
         # target_text format: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
         target_chat = (
@@ -740,12 +788,7 @@ class Model(nn.Module):
             if language.lower() in config.codec_language_id:
                 language_id = config.codec_language_id[language.lower()]
 
-        # 8. Speaker embedding (ICL still uses x-vector)
-        speaker_embed = None
-        if self.speaker_encoder is not None:
-            speaker_embed = self.extract_speaker_embedding(audio_for_spk)
-
-        # 9. Build codec prefix (think/nothink + speaker + pad + bos)
+        # 8. Build codec prefix (think/nothink + speaker + pad + bos)
         if language_id is None:
             codec_prefill = [
                 config.codec_nothink_id,
@@ -782,12 +825,12 @@ class Model(nn.Module):
                 [codec_prefix_embed, codec_prefix_suffix], axis=1
             )
 
-        # 10. Role embedding (first 3 tokens: <|im_start|>assistant\n)
+        # 9. Role embedding (first 3 tokens: <|im_start|>assistant\n)
         role_embed = self.talker.text_projection(
             self.talker.get_text_embeddings()(target_ids[:, :3])
         )
 
-        # 11. Build pad/bos prefix (text side overlaid with codec prefix[:-1])
+        # 10. Build pad/bos prefix (text side overlaid with codec prefix[:-1])
         pad_count = codec_prefix_embed.shape[1] - 2
         pad_embeds = mx.broadcast_to(
             tts_pad_embed, (1, pad_count, tts_pad_embed.shape[-1])
@@ -795,7 +838,7 @@ class Model(nn.Module):
         combined_prefix = mx.concatenate([pad_embeds, tts_bos_embed], axis=1)
         combined_prefix = combined_prefix + codec_prefix_embed[:, :-1, :]
 
-        # 12. Full input_embeds: role + codec_prefix + icl_embed
+        # 11. Full input_embeds: role + codec_prefix + icl_embed
         input_embeds = mx.concatenate(
             [role_embed, combined_prefix, icl_input_embed], axis=1
         )
@@ -1133,6 +1176,7 @@ class Model(nn.Module):
         lang_code: str = "auto",
         ref_audio: Optional[Union[str, mx.array]] = None,
         ref_text: Optional[str] = None,
+        voice_clone_prompt: Optional[Dict[str, mx.array]] = None,
         split_pattern: str = "\n",
         max_tokens: int = 4096,
         verbose: bool = False,
@@ -1162,6 +1206,7 @@ class Model(nn.Module):
             lang_code: Language code (auto, chinese, english, etc.)
             ref_audio: Reference audio for voice cloning (file path or mx.array)
             ref_text: Reference text for voice cloning
+            voice_clone_prompt: Precomputed voice clone prompt artifacts
             split_pattern: Pattern to split text into segments
             max_tokens: Maximum tokens per segment
             verbose: Print verbose output
@@ -1230,6 +1275,10 @@ class Model(nn.Module):
 
         # Check if we should use ICL mode
         use_icl = (
+            voice_clone_prompt is not None
+            and "ref_codes" in voice_clone_prompt
+            and "ref_text_ids" in voice_clone_prompt
+        ) or (
             ref_audio is not None
             and ref_text is not None
             and self.speech_tokenizer.has_encoder
@@ -1243,6 +1292,7 @@ class Model(nn.Module):
                 text=text,
                 ref_audio=ref_audio,
                 ref_text=ref_text,
+                voice_clone_prompt=voice_clone_prompt,
                 language=lang_code,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -1298,6 +1348,11 @@ class Model(nn.Module):
                     speaker=voice,
                     ref_audio=ref_audio,
                     ref_text=ref_text,
+                    speaker_embedding=(
+                        voice_clone_prompt.get("speaker_embedding")
+                        if voice_clone_prompt is not None
+                        else None
+                    ),
                 )
             )
 
@@ -2204,8 +2259,9 @@ class Model(nn.Module):
     def _generate_icl(
         self,
         text: str,
-        ref_audio: mx.array,
-        ref_text: str,
+        ref_audio: Optional[mx.array] = None,
+        ref_text: Optional[str] = None,
+        voice_clone_prompt: Optional[Dict[str, mx.array]] = None,
         language: str = "auto",
         temperature: float = 0.9,
         max_tokens: int = 4096,
@@ -2228,15 +2284,19 @@ class Model(nn.Module):
         if verbose:
             print(f"ICL generation: {text[:50]}...")
 
-        # Prepare ICL inputs
-        input_embeds, trailing_text_hidden, tts_pad_embed, ref_codes = (
-            self._prepare_icl_generation_inputs(
-                text=text,
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-                language=language,
+        if voice_clone_prompt is None:
+            if ref_audio is None or ref_text is None:
+                raise ValueError(
+                    "Either voice_clone_prompt or both ref_audio and ref_text are required"
+                )
+            prepared = self._prepare_icl_generation_inputs(
+                text=text, ref_audio=ref_audio, ref_text=ref_text, language=language
             )
-        )
+        else:
+            prepared = self._prepare_icl_generation_inputs_from_prompt(
+                text=text, voice_clone_prompt=voice_clone_prompt, language=language
+            )
+        input_embeds, trailing_text_hidden, tts_pad_embed, ref_codes = prepared
 
         # Honor the caller-provided max_tokens; matches the base generation path.
         # A text-length-derived cap could clip slow or expressive utterances.

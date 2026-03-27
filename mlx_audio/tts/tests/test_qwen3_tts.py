@@ -383,6 +383,8 @@ class _DtypeTestTalker:
 
 
 class _DtypeTestSpeechTokenizer:
+    has_encoder = True
+
     def encode(self, audio):
         return mx.zeros((1, 2, 2), dtype=mx.int32)
 
@@ -416,6 +418,41 @@ def _make_dtype_test_model():
 
 
 class TestQwen3TTSSpeakerEmbeddingDtype(unittest.TestCase):
+    def test_cached_icl_prompt_matches_direct_reference_and_reuses_encoding(self):
+        model = _make_dtype_test_model()
+        audio = mx.zeros((2400,), dtype=mx.float32)
+        with patch.object(
+            model.speech_tokenizer, "encode", wraps=model.speech_tokenizer.encode
+        ) as encode:
+            direct = model._prepare_icl_generation_inputs(
+                text="same target", ref_audio=audio, ref_text="reference transcript"
+            )
+            prompt = model.create_voice_clone_prompt(audio, "reference transcript")
+            cached = model._prepare_icl_generation_inputs_from_prompt(
+                text="same target", voice_clone_prompt=prompt
+            )
+            self.assertEqual(encode.call_count, 1)
+        for actual, expected in zip(cached, direct):
+            self.assertEqual(actual.dtype, expected.dtype)
+            np.testing.assert_array_equal(
+                np.array(actual.astype(mx.float32)),
+                np.array(expected.astype(mx.float32)),
+            )
+
+    def test_cached_speaker_embedding_does_not_reextract_reference(self):
+        model = _make_dtype_test_model()
+        audio = mx.zeros((2400,), dtype=mx.float32)
+        prompt = model.create_voice_clone_prompt(audio)
+        model.extract_speaker_embedding = lambda audio: self.fail(
+            "unexpected extraction"
+        )
+        prepared = model._prepare_generation_inputs(
+            text="same target",
+            ref_audio=audio,
+            speaker_embedding=prompt["speaker_embedding"],
+        )
+        self.assertEqual(prepared[0].dtype, mx.bfloat16)
+
     def test_xvector_prefill_uses_talker_dtype(self):
         model = _make_dtype_test_model()
 
