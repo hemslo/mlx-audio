@@ -19,6 +19,23 @@ from mlx_audio.speech_stream import AudioChunk, encode_audio_stream
 from mlx_audio.voice_registry import VoiceRegistry
 
 
+def test_old_prompt_cache_is_rebuilt_without_removing_voice(registry):
+    import mlx.core as mx
+
+    registry.create_voice("old-cache", "consent", b"recording", transcript="Hello")
+    path = registry.get_prompt_cache_path("old-cache", "qwen")
+    np.savez(path, schema_version=np.array([1]), ref_text_ids=np.array([[1, 2]]))
+    assert registry.load_prompt_cache("old-cache", "qwen") is None
+    assert registry.get_audio_sample_path("old-cache").read_bytes() == b"recording"
+    assert registry.get_voice("old-cache")["transcript"] == "Hello"
+    registry.store_prompt_cache(
+        "old-cache", "qwen", {"ref_text_ids": mx.array([[3, 4]])}
+    )
+    assert registry.load_prompt_cache("old-cache", "qwen")["ref_text_ids"].tolist() == [
+        [3, 4]
+    ]
+
+
 @pytest.fixture
 def registry(tmp_path, monkeypatch):
     registry = VoiceRegistry(tmp_path / "voices")

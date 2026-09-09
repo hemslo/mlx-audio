@@ -14,6 +14,16 @@ from mlx_audio.tts.models.qwen3_tts.speaker_encoder import (
 )
 
 
+def test_post_load_selects_qwen_tokenizer_and_official_regex_fix(tmp_path):
+    model = SimpleNamespace(tokenizer=None)
+    with patch("transformers.AutoTokenizer.from_pretrained") as load:
+        assert Model.post_load_hook(model, tmp_path) is model
+    load.assert_called_once_with(
+        str(tmp_path), tokenizer_type="qwen2", fix_mistral_regex=True
+    )
+    assert model.tokenizer is load.return_value
+
+
 def _top_p_keep_mask(scores, top_p):
     probs = mx.softmax(scores, axis=-1)
     sorted_indices = mx.argsort(scores, axis=-1)

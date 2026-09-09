@@ -2884,7 +2884,12 @@ class Model(nn.Module):
         try:
             from transformers import AutoTokenizer
 
-            model.tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+            # Qwen3-TTS checkpoints use Qwen2Tokenizer. Selecting it explicitly
+            # avoids AutoConfig's unsupported qwen3_tts fallback in Transformers.
+            # Match the regex correction enabled by the official Qwen TTS loader.
+            model.tokenizer = AutoTokenizer.from_pretrained(
+                str(model_path), tokenizer_type="qwen2", fix_mistral_regex=True
+            )
         except Exception as e:
             print(f"Warning: Could not load tokenizer: {e}")
 

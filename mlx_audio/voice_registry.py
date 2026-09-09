@@ -10,7 +10,9 @@ import mlx.core as mx
 import numpy as np
 
 VOICE_SAMPLE_MAX_BYTES = 10 * 1024 * 1024
-VOICE_CACHE_SCHEMA_VERSION = 1
+# Version 2 rebuilds reference text IDs with Qwen's corrected tokenizer regex.
+# Uploaded recordings and voice metadata are unaffected.
+VOICE_CACHE_SCHEMA_VERSION = 2
 SUPPORTED_VOICE_SAMPLE_MIME_TYPES = {
     "audio/mpeg": ".mp3",
     "audio/wav": ".wav",

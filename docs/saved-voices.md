@@ -37,8 +37,9 @@ Saved voices cannot be combined with `ref_audio` or `ref_text` in a speech reque
 - `DELETE /v1/audio/voices/my-voice` removes the recording and cached prompts.
 
 Recordings and Qwen3 prompts persist under `~/.cache/mlx-audio/voices`, configurable
-with `MLX_AUDIO_VOICES_DIR`. Existing saved voices and version-1 prompt caches
-remain usable. Qwen3 Base prompts are computed on first use and reused after
+with `MLX_AUDIO_VOICES_DIR`. Existing saved voices remain usable. Version-1 prompt
+caches are rebuilt on next use with the corrected Qwen tokenizer; recordings
+and metadata are preserved. Qwen3 Base prompts are computed on first use and reused after
 server restarts. Other reference-audio models receive the saved recording and
 transcript. Saved-voice requests run serially on the inference worker; ordinary
 requests retain upstream batching.
