@@ -55,7 +55,7 @@ loading, first-use prompt preparation, and codec buffering.
 curl --no-buffer http://127.0.0.1:8000/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{"model":"mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit","input":"This audio arrives while speech is still being generated.","voice":"my-voice","lang_code":"English","response_format":"pcm","stream":true,"streaming_interval":0.32}' \
-  | ffplay -autoexit -f s16le -ar 24000 -ac 1 -i pipe:0
+  | ffplay -nodisp -autoexit -f s16le -sample_rate 24000 -ch_layout mono -i pipe:0
 ```
 
 PCM responses are headerless signed 16-bit little-endian mono at 24 kHz, including
