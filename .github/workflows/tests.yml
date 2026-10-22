@@ -43,6 +43,11 @@ jobs:
       - name: Install all deps
         run: pip install -e ".[all,dev]"
 
+      - name: Install ffmpeg for server audio tests
+        run: |
+          brew install ffmpeg
+          ffmpeg -version
+
       - name: Test DSP imports without TTS/STT
         run: |
           python -c "from mlx_audio.dsp import stft, mel_filters; print('DSP OK')"
@@ -59,7 +64,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install with parity extra
         run: |

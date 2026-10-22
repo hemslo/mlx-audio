@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import numpy as np
@@ -12,6 +12,7 @@ from mlx_audio.tts.models.qwen3_tts.speaker_encoder import (
     TimeDelayNetBlock,
     reflect_pad_1d,
 )
+from mlx_audio.tts.models.qwen3_tts.speech_tokenizer import DecoderBlockUpsample
 
 
 def test_post_load_selects_qwen_tokenizer_and_official_regex_fix(tmp_path):
@@ -427,6 +428,81 @@ def _make_dtype_test_model():
     return model
 
 
+class TestQwen3TTSTextConditioning(unittest.TestCase):
+    @staticmethod
+    def make_model(model_type="custom_voice"):
+        model = _make_dtype_test_model()
+        model.config.tts_model_type = model_type
+
+        def encode(text):
+            if text.startswith("<|im_start|>user\n"):
+                return list(range(12))
+            content = text.split("\n", 1)[1].split("<|im_end|>", 1)[0]
+            return list(range(3 + len(content) + 5))
+
+        model.tokenizer.encode = encode
+        model.talker.embedding = lambda ids: mx.broadcast_to(
+            ids.astype(mx.bfloat16)[..., None], (*ids.shape, 4)
+        )
+        return model
+
+    def test_prefill_complete_text_for_all_model_types(self):
+        expected = [0, 1, 2, 7, 8, 9, 9, 11, 12, 13, 14, 10, 12]
+        for model_type in ("base", "custom_voice", "voice_design"):
+            with self.subTest(model_type=model_type):
+                model = self.make_model(model_type)
+                inputs, trailing, pad = model._prepare_generation_inputs("text")
+                self.assertEqual(inputs[0, :, 0].tolist(), expected)
+                self.assertEqual(trailing.tolist(), pad.tolist())
+                self.assertEqual(trailing.shape, (1, 1, 4))
+                self.assertEqual(inputs.dtype, mx.bfloat16)
+
+    def test_xvector_only_prefills_complete_text(self):
+        model = self.make_model("base")
+        ref_audio = mx.zeros((2400,), dtype=mx.float32)
+        with patch.object(
+            model, "extract_speaker_embedding", wraps=model.extract_speaker_embedding
+        ) as extract:
+            inputs, trailing, pad = model._prepare_generation_inputs(
+                "text", ref_audio=ref_audio
+            )
+        extract.assert_called_once_with(ref_audio)
+        self.assertEqual(inputs.shape[1], 14)
+        self.assertEqual(inputs[0, -6:, 0].tolist(), [11, 12, 13, 14, 10, 12])
+        self.assertEqual(inputs.dtype, mx.bfloat16)
+        self.assertEqual(trailing.tolist(), pad.tolist())
+
+    def test_instructions_remain_before_role_and_complete_text(self):
+        model = self.make_model()
+        inputs, trailing, _ = model._prepare_generation_inputs(
+            "text", instruct="Speak calmly."
+        )
+        self.assertEqual(inputs[0, :12, 0].tolist(), list(range(12)))
+        self.assertEqual(inputs.shape[1], 25)
+        self.assertEqual(trailing.shape[1], 1)
+
+    def test_batch_prefill_preserves_unequal_text_lengths(self):
+        model = self.make_model()
+        texts = ["a", "longer text"]
+        batch = model._prepare_batch_inputs(texts, return_metadata=True)
+        self.assertEqual(batch.prefill_lens, [10, 20])
+        self.assertEqual(batch.left_padding, [10, 0])
+        self.assertEqual(batch.trailing_lens, [1, 1])
+        self.assertEqual(batch.attention_mask[0].tolist(), [0] * 10 + [1] * 10)
+        self.assertEqual(batch.attention_mask[1].tolist(), [1] * 20)
+        for index, text in enumerate(texts):
+            with self.subTest(text=text):
+                inputs, _, pad = model._prepare_generation_inputs(text)
+                left = batch.left_padding[index]
+                self.assertEqual(
+                    batch.input_embeds[index : index + 1, left:].tolist(),
+                    inputs.tolist(),
+                )
+                self.assertEqual(
+                    batch.trailing_text_hidden[index : index + 1].tolist(), pad.tolist()
+                )
+
+
 class TestQwen3TTSSpeakerEmbeddingDtype(unittest.TestCase):
     def test_cached_icl_prompt_matches_direct_reference_and_reuses_encoding(self):
         model = _make_dtype_test_model()
@@ -533,6 +609,7 @@ def _make_generation_test_model(text_token_count: int = 10):
 
     model = Model.__new__(Model)
     model._sample_rate = 24000
+    model.generate_config = None
     model.config = SimpleNamespace(
         talker_config=SimpleNamespace(
             vocab_size=vocab_size,
@@ -774,6 +851,126 @@ class TestQwen3TTSNoEosFilterBypass(unittest.TestCase):
             Model._sample_token_batch(model, logits, eos_token_id=1)
 
 
+class TestQwen3TTSGenerationDefaults(unittest.TestCase):
+    def _instruct_options(self, model_type, config=None, **overrides):
+        model = _make_generation_test_model()
+        model.config.tts_model_type = model_type
+        model.config.tts_model_size = "1b7"
+        model.supported_speakers = ["Vivian"]
+        model.load_generate_config(config)
+        with patch.object(
+            model, "_generate_with_instruct", return_value=iter(())
+        ) as gen:
+            if model_type == "custom_voice":
+                list(
+                    model.generate_custom_voice("hello", speaker="Vivian", **overrides)
+                )
+            else:
+                list(
+                    model.generate_voice_design(
+                        "hello", instruct="warm voice", **overrides
+                    )
+                )
+        return gen.call_args.kwargs
+
+    def test_reference_defaults_without_metadata(self):
+        for model_type in ("custom_voice", "voice_design"):
+            with self.subTest(model_type=model_type):
+                options = self._instruct_options(model_type)
+                self.assertEqual(options["temperature"], 0.9)
+                self.assertEqual(options["max_tokens"], 2048)
+                self.assertEqual(options["top_k"], 50)
+                self.assertEqual(options["top_p"], 1.0)
+                self.assertEqual(options["repetition_penalty"], 1.05)
+
+    def test_metadata_defaults_and_explicit_overrides(self):
+        config = dict(
+            temperature=0.5,
+            max_new_tokens=8192,
+            top_k=30,
+            top_p=0.8,
+            repetition_penalty=1.1,
+        )
+        for model_type in ("custom_voice", "voice_design"):
+            with self.subTest(model_type=model_type):
+                options = self._instruct_options(model_type, config)
+                for name, value in config.items():
+                    self.assertEqual(
+                        options["max_tokens" if name == "max_new_tokens" else name],
+                        value,
+                    )
+
+                overrides = dict(
+                    temperature=0.0,
+                    max_tokens=17,
+                    top_k=0,
+                    top_p=1.0,
+                    repetition_penalty=1.0,
+                )
+                options = self._instruct_options(model_type, config, **overrides)
+                for name, value in overrides.items():
+                    self.assertEqual(options[name], value)
+                self.assertEqual(config["temperature"], 0.5)
+
+    def test_partial_and_null_metadata_fall_back_to_reference(self):
+        options = self._instruct_options(
+            "voice_design",
+            dict(temperature=None, max_new_tokens=None, top_k=0),
+            temperature=None,
+            max_tokens=None,
+        )
+        self.assertEqual(options["temperature"], 0.9)
+        self.assertEqual(options["max_tokens"], 2048)
+        self.assertEqual(options["top_k"], 0)
+        self.assertEqual(options["top_p"], 1.0)
+        self.assertEqual(options["repetition_penalty"], 1.05)
+
+    def test_generate_uses_metadata_for_base_sampling_and_token_limit(self):
+        model = _make_generation_test_model()
+        model.load_generate_config(
+            dict(
+                temperature=0.4,
+                max_new_tokens=3,
+                top_k=20,
+                top_p=0.85,
+                repetition_penalty=1.1,
+            )
+        )
+        with patch.object(model, "_sample_token", wraps=model._sample_token) as sample:
+            results = list(model.generate("hello"))
+
+        self.assertEqual(results[-1].token_count, 3)
+        options = sample.call_args.kwargs
+        self.assertEqual(options["temperature"], 0.4)
+        self.assertEqual(options["top_k"], 20)
+        self.assertEqual(options["top_p"], 0.85)
+        self.assertEqual(options["repetition_penalty"], 1.1)
+
+    def test_batch_generate_resolves_metadata_before_creating_session(self):
+        model = _make_generation_test_model()
+        model.load_generate_config(
+            dict(
+                temperature=0.4,
+                max_new_tokens=8192,
+                top_k=20,
+                top_p=0.85,
+                repetition_penalty=1.1,
+            )
+        )
+        session = MagicMock(idle=True)
+        with patch.object(
+            model, "create_tts_batch_session", return_value=session
+        ) as create:
+            list(model.batch_generate(["hello"], temperature=0.0, top_k=0))
+
+        options = create.call_args.args[0]
+        self.assertEqual(options.temperature, 0.0)
+        self.assertEqual(options.max_tokens, 8192)
+        self.assertEqual(options.top_k, 0)
+        self.assertEqual(options.top_p, 0.85)
+        self.assertEqual(options.repetition_penalty, 1.1)
+
+
 class TestQwen3TTSMaxTokens(unittest.TestCase):
     def test_generate_with_instruct_honors_explicit_max_tokens(self):
         model = _make_generation_test_model(text_token_count=10)
@@ -846,6 +1043,42 @@ class TestQwen3TTSBaseVoiceValidation(unittest.TestCase):
         results = list(model.generate(text="Hello", voice="vivian", max_tokens=1))
 
         self.assertTrue(results)
+
+
+class TestDecoderBlockUpsampleStreaming(unittest.TestCase):
+    """Tests for DecoderBlockUpsample streaming (step) against the full call."""
+
+    def _block(self, upsample_rate):
+        mx.random.seed(0)
+        block = DecoderBlockUpsample(in_dim=6, out_dim=5, upsample_rate=upsample_rate)
+        # Non-zero bias, so a doubled bias at chunk boundaries shows
+        block.conv.bias = mx.random.normal(block.conv.bias.shape)
+        return block
+
+    def _stream(self, block, x, chunk_sizes):
+        block.reset_state()
+        out, start = [], 0
+        for size in chunk_sizes:
+            out.append(block.step(x[:, start : start + size, :]))
+            start += size
+        self.assertEqual(start, x.shape[1])
+        return mx.concatenate(out, axis=1)
+
+    def test_step_matches_full_call_for_any_chunking(self):
+        """Test that streaming in any chunk sizes matches one call."""
+        for upsample_rate in (2, 4, 8):
+            block = self._block(upsample_rate)
+            x = mx.random.normal((1, 12, 6))
+            full = block(x)
+            for chunks in ([1] * 12, [2] * 6, [3, 1, 4, 4], [12]):
+                streamed = self._stream(block, x, chunks)
+                self.assertEqual(streamed.shape, full.shape)
+                np.testing.assert_allclose(
+                    np.array(streamed),
+                    np.array(full),
+                    atol=1e-5,
+                    err_msg=f"upsample_rate={upsample_rate}, chunks={chunks}",
+                )
 
 
 if __name__ == "__main__":

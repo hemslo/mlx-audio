@@ -30,6 +30,7 @@ Generate natural-sounding speech from text. Multiple models with multilingual su
 | **KittenTTS** | Compact KittenTTS 0.8 models for edge-friendly TTS | EN | [nano](https://huggingface.co/mlx-community/kitten-tts-nano-0.8) / [micro](https://huggingface.co/mlx-community/kitten-tts-micro-0.8) / [mini](https://huggingface.co/mlx-community/kitten-tts-mini-0.8) |
 | **Qwen3-TTS** | Alibaba's multilingual TTS with voice design | ZH, EN, JA, KO, + more | [mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16) |
 | **Voxtral TTS** | Mistral's 4B multilingual TTS (20 voices, 9 languages) | EN, FR, ES, DE, IT, PT, NL, AR, HI | [mlx-community/Voxtral-4B-TTS-2603-mlx-bf16](https://huggingface.co/mlx-community/Voxtral-4B-TTS-2603-mlx-bf16) |
+| **rumik-oss 1** | 3B expressive multilingual Indic TTS with 22-language support, description-conditioned delivery and inline vocalizations | 22 Indic languages + EN | [rumik-ai/rumik-oss-1](https://huggingface.co/rumik-ai/rumik-oss-1), [8bit](https://huggingface.co/rumik-ai/rumik-oss-1-mlx-8bit), [4bit](https://huggingface.co/rumik-ai/rumik-oss-1-mlx-4bit) |
 | **VoxCPM2** | 2B tokenizer-free TTS with 48kHz output, voice design, voice cloning, and continuation | 30 languages | [bf16](https://huggingface.co/mlx-community/VoxCPM2-bf16), [8bit](https://huggingface.co/mlx-community/VoxCPM2-8bit), [4bit](https://huggingface.co/mlx-community/VoxCPM2-4bit) |
 | **CSM / MisoTTS** | Sesame-style conversational speech models with voice cloning | EN | [mlx-community/csm-1b](https://huggingface.co/mlx-community/csm-1b), [MisoTTS bf16](https://huggingface.co/mlx-community/MisoLabs-MisoTTS-bf16), [MisoTTS 8bit](https://huggingface.co/mlx-community/MisoLabs-MisoTTS-8bit) |
 | **Dia** | Dialogue-focused TTS | EN | [mlx-community/Dia-1.6B-fp16](https://huggingface.co/mlx-community/Dia-1.6B-fp16) |
@@ -39,6 +40,7 @@ Generate natural-sounding speech from text. Multiple models with multilingual su
 | **OuteTTS** | Efficient TTS model | EN | [mlx-community/OuteTTS-1.0-0.6B-fp16](https://huggingface.co/mlx-community/OuteTTS-1.0-0.6B-fp16) |
 | **Spark** | SparkTTS model | EN, ZH | [mlx-community/Spark-TTS-0.5B-bf16](https://huggingface.co/mlx-community/Spark-TTS-0.5B-bf16) |
 | **Ming Omni TTS (BailingMM)** | Multimodal generation with voice cloning and style control | EN, ZH | [mlx-community/Ming-omni-tts-16.8B-A3B-bf16](https://huggingface.co/mlx-community/Ming-omni-tts-16.8B-A3B-bf16) |
+| **Ming-3.0 TTS (Dense)** | 0.5B multilingual TTS with voice cloning, built-in voices and style control | ZH, EN, DE, ES, FR, KO, JA | [mlx-community/Ming-3.0-tts-0.5B-bf16](https://huggingface.co/mlx-community/Ming-3.0-tts-0.5B-bf16) |
 | **Ming Omni TTS (Dense)** | Lightweight dense Ming Omni variant | EN, ZH | [mlx-community/Ming-omni-tts-0.5B-bf16](https://huggingface.co/mlx-community/Ming-omni-tts-0.5B-bf16) |
 
 [:octicons-arrow-right-24: Browse TTS Models](tts/index.md)
@@ -54,6 +56,7 @@ Transcribe and understand speech with state-of-the-art accuracy. Streaming suppo
 | **Whisper** | OpenAI's robust STT model | 99+ languages | [mlx-community/whisper-large-v3-turbo-asr-fp16](https://huggingface.co/mlx-community/whisper-large-v3-turbo-asr-fp16) |
 | **Distil-Whisper** | Distilled fast Whisper variants | EN | [distil-whisper/distil-large-v3](https://huggingface.co/distil-whisper/distil-large-v3) |
 | **Qwen3-ASR** | Alibaba's multilingual ASR | ZH, EN, JA, KO, + more | [mlx-community/Qwen3-ASR-1.7B-8bit](https://huggingface.co/mlx-community/Qwen3-ASR-1.7B-8bit) |
+| **MiMo-V2.5-ASR** | Xiaomi's speech recognition model | ZH, EN | [MiMo-V2.5-ASR](https://huggingface.co/mlx-community/MiMo-V2.5-ASR-MLX) |
 | **Qwen3-ForcedAligner** | Word-level audio alignment | ZH, EN, JA, KO, + more | [mlx-community/Qwen3-ForcedAligner-0.6B-8bit](https://huggingface.co/mlx-community/Qwen3-ForcedAligner-0.6B-8bit) |
 | **MOSS-Transcribe-Diarize** | End-to-end transcription with timestamps and speaker labels | Multiple major languages | https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize |
 | **Parakeet** | NVIDIA's accurate STT | EN (v2), 25 EU languages (v3) | [mlx-community/parakeet-tdt-0.6b-v3](https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3) |

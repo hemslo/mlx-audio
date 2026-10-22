@@ -1,168 +1,180 @@
-"""Generate enhanced audio using speech-to-speech models.
+"""Generate speech, text, or enhanced audio with the standard STS interface.
 
-Usage:
-    python -m mlx_audio.sts.generate --model mlx-community/DeepFilterNet-mlx --audio noisy.wav
-    python -m mlx_audio.sts.generate --model mlx-community/DeepFilterNet-mlx --audio noisy.wav --version 2
-    python -m mlx_audio.sts.generate --model mlx-community/DeepFilterNet-mlx --audio noisy.wav --stream
-    python -m mlx_audio.sts.generate --model starkdmi/MossFormer2_SE_48K_MLX --audio noisy.wav
+Models implement ``generate(audio, **kwargs)`` and return a result with
+``audio``, ``sample_rate``, and optionally ``text`` or named ``audios``.
+Loading and task-specific processing belong to the model packages.
 """
 
 from __future__ import annotations
 
 import argparse
+import inspect
+import json
 import time
 from pathlib import Path
 
-# Repo ID substrings to model type mapping
-REPO_HINTS = {
-    "deepfilter": "deepfilternet",
-    "mossformer": "mossformer2",
-    "nemotronlabs-voicechat": "nemotron_voicechat",
-    "nemotron_voicechat": "nemotron_voicechat",
-}
+from mlx_audio import audio_io
+from mlx_audio.sts.utils import load_model
 
 
-def _detect_model_type(model_name: str) -> str:
-    """Detect model type from repo ID or path name."""
-    lower = model_name.lower()
-    for hint, model_type in REPO_HINTS.items():
-        if hint in lower:
-            return model_type
-    raise ValueError(
-        f"Cannot detect model type from '{model_name}'. "
-        f"Supported models: {', '.join(REPO_HINTS.keys())}"
-    )
+def generate_audio(
+    model=None,
+    audio=None,
+    output_path=None,
+    verbose=False,
+    gen_kwargs=None,
+    model_kwargs=None,
+    **kwargs,
+):
+    """Run STS generation with a model ID, local path, or loaded model.
 
+    ``kwargs`` and ``gen_kwargs`` are passed to ``model.generate``; values in
+    ``gen_kwargs`` take precedence. ``model_kwargs`` are passed to the loader.
+    Omitted options use the model's defaults. The original result is returned.
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Enhance audio using speech-to-speech models"
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="mlx-community/DeepFilterNet-mlx",
-        help="HuggingFace repo ID or local path to the model",
-    )
-    parser.add_argument(
-        "--audio",
-        type=str,
-        required=True,
-        help="Path to the input audio file",
-    )
-    parser.add_argument(
-        "--output-path",
-        type=str,
-        default=None,
-        help="Output audio file path (default: <input>_enhanced.wav)",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print detailed processing information",
-    )
-    parser.add_argument(
-        "--system-prompt",
-        type=str,
-        default=None,
-        help="Optional system prompt for conversational speech models",
-    )
+    Audio is saved to ``output_path`` and text to a sibling ``.txt`` file.
+    Named audio outputs are saved as ``<stem>_<name>.wav``. Without an explicit
+    path, use ``<input stem>_output.wav`` or ``sts_output.wav`` for text input;
+    models may supply an ``output_suffix`` for their default audio filename.
+    """
+    if model is None:
+        raise ValueError("Model path or model instance must be provided.")
+    if isinstance(model, (str, Path)):
+        model = load_model(model, **(model_kwargs or {}))
+    elif model_kwargs:
+        raise ValueError("model_kwargs require a model ID or path")
 
-    # DeepFilterNet-specific options
-    dfn = parser.add_argument_group("DeepFilterNet options")
-    dfn.add_argument(
-        "--version",
-        type=int,
-        default=None,
-        choices=[1, 2, 3],
-        help="DeepFilterNet version (1, 2, or 3). Default: 3",
-    )
-    dfn.add_argument(
-        "--subfolder",
-        type=str,
-        default=None,
-        help="Subfolder within the model repo (e.g. v1, v2, v3)",
-    )
-    dfn.add_argument(
-        "--stream",
-        action="store_true",
-        help="Use streaming enhancement mode (DeepFilterNet v2/v3 only)",
-    )
+    generate = getattr(model, "generate", None)
+    if not callable(generate):
+        raise TypeError("This STS model does not implement generate(audio, **kwargs)")
+    options = {**kwargs, **(gen_kwargs or {})}
+    if (
+        "stream" in options
+        and "stream" not in inspect.signature(generate).parameters
+        and options.pop("stream")
+    ):
+        raise ValueError("This STS model does not support streaming generation")
 
-    return parser.parse_args()
+    started = time.perf_counter()
+    result = generate(audio, **options)
+    if not hasattr(result, "audio") or not hasattr(result, "sample_rate"):
+        raise TypeError(
+            "STS generate() must return a result with audio and sample_rate attributes"
+        )
 
-
-def main():
-    args = parse_args()
-
-    in_path = Path(args.audio).expanduser().resolve()
-    if not in_path.exists():
-        raise FileNotFoundError(f"Input audio file not found: {in_path}")
-
-    if args.output_path:
-        out_path = Path(args.output_path).expanduser().resolve()
-    else:
-        out_path = in_path.with_stem(in_path.stem + "_enhanced")
-
-    model_type = _detect_model_type(args.model)
-
-    if args.verbose:
-        print(f"Model:  {args.model}")
-        print(f"Type:   {model_type}")
-        print(f"Input:  {in_path}")
-        print(f"Output: {out_path}")
-
-    start = time.time()
-
-    if model_type == "deepfilternet":
-        from mlx_audio.sts.models.deepfilternet import DeepFilterNetModel
-
-        load_kwargs = {"model_name_or_path": args.model}
-        if args.version is not None:
-            load_kwargs["version"] = args.version
-        elif args.subfolder is not None:
-            load_kwargs["subfolder"] = args.subfolder
-
-        model = DeepFilterNetModel.from_pretrained(**load_kwargs)
-
-        if args.stream:
-            model.enhance_file_streaming(str(in_path), str(out_path))
-            mode = "streaming"
+    if output_path is None:
+        if isinstance(audio, (str, Path)):
+            source = Path(audio).expanduser()
+            suffix = getattr(model, "output_suffix", "_output")
+            output_path = source.with_name(source.stem + suffix + ".wav")
         else:
-            model.enhance_file(str(in_path), str(out_path))
-            mode = "offline"
+            output_path = "sts_output.wav"
+    output = Path(output_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if result.audio is not None:
+        audio_io.write(str(output), result.audio, result.sample_rate)
+        print(f"Saved: {output}")
+    for name, waveform in getattr(result, "audios", {}).items():
+        path = output.with_name(f"{output.stem}_{name}.wav")
+        audio_io.write(str(path), waveform, result.sample_rate)
+        print(f"Saved: {path}")
+    text = getattr(result, "text", None)
+    if text is not None:
+        print(text)
+        text_path = output.with_suffix(".txt")
+        text_path.write_text(text + "\n", encoding="utf-8")
+        print(f"Saved: {text_path}")
+    if verbose:
+        reasoning = getattr(result, "reasoning", None)
+        if reasoning:
+            print(f"Reasoning: {reasoning}")
+        print(f"Time: {time.perf_counter() - started:.2f}s")
+        tokens = getattr(result, "generation_tokens", None)
+        if tokens is not None:
+            print(f"Generated {tokens} tokens ({getattr(result, 'finish_reason', '')})")
+    return result
 
-    elif model_type == "mossformer2":
-        from mlx_audio import audio_io
-        from mlx_audio.sts.models.mossformer2_se import MossFormer2SEModel
 
-        model = MossFormer2SEModel.from_pretrained(args.model)
-        enhanced = model.enhance(str(in_path))
-        audio_io.write(str(out_path), enhanced, model.config.sample_rate)
-        mode = "offline"
+def _json_object(value):
+    result = json.loads(value)
+    if not isinstance(result, dict):
+        raise argparse.ArgumentTypeError("Expected a JSON object")
+    return result
 
-    elif model_type == "nemotron_voicechat":
-        from mlx_audio import audio_io
-        from mlx_audio.sts import load
 
-        model = load(args.model)
-        generate_kwargs = {}
-        if args.system_prompt is not None:
-            generate_kwargs["system_prompt"] = args.system_prompt
-        result = model.generate(str(in_path), **generate_kwargs)
-        audio_io.write(str(out_path), result.audio, result.sample_rate)
-        text_path = out_path.with_suffix(".txt")
-        text_path.write_text(result.text + "\n", encoding="utf-8")
-        print(result.text)
-        mode = "offline"
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Generate speech, text, or enhanced audio using STS models",
+        argument_default=argparse.SUPPRESS,
+    )
+    parser.add_argument("--model", default="mlx-community/DeepFilterNet-mlx")
+    parser.add_argument("--audio", help="Path to input audio")
+    parser.add_argument(
+        "--output-path", help="Output audio path; text is saved to a sibling .txt file"
+    )
+    parser.add_argument("--verbose", action="store_true")
 
-    elapsed = time.time() - start
+    inputs = parser.add_argument_group("Input options")
+    inputs.add_argument("--task", help="Generation task supported by the model")
+    inputs.add_argument("--text")
+    inputs.add_argument("--system-prompt")
+    inputs.add_argument("--messages", help="JSON file containing dialogue messages")
+    inputs.add_argument("--segments", help="JSON file containing completion segments")
+    inputs.add_argument(
+        "--prompt-examples", help="JSON file containing few-shot examples"
+    )
+    inputs.add_argument("--instruction", help="Base few-shot task instruction")
+    inputs.add_argument("--instruct")
+    inputs.add_argument("--thinking", action="store_true")
+    inputs.add_argument(
+        "--natural-instruction", dest="read_text_only", action="store_false"
+    )
+    inputs.add_argument("--sample-rate", type=int, help="Sample rate for audio arrays")
 
-    if args.verbose:
-        print(f"Mode:   {mode}")
-        print(f"Time:   {elapsed:.2f}s")
+    generation = parser.add_argument_group("Generation options")
+    generation.add_argument("--max-new-tokens", type=int)
+    generation.add_argument("--temperature", type=float)
+    generation.add_argument("--audio-temperature", type=float)
+    generation.add_argument("--top-p", type=float)
+    generation.add_argument("--top-k", type=int)
+    generation.add_argument("--seed", type=int)
+    generation.add_argument("--no-repeat-ngram-size", type=int)
+    generation.add_argument("--stream", action="store_true")
+    generation.add_argument(
+        "--gen-kwargs", type=_json_object, help="Generate kwargs as JSON"
+    )
 
-    print(f"Saved:  {out_path}")
+    speech = parser.add_argument_group("Speech output options")
+    speech.add_argument("--voice")
+    speech.add_argument("--ref-audio")
+    speech.add_argument("--ref-text")
+    speech.add_argument("--max-talker-steps", type=int)
+    speech.add_argument("--audio-tokenizer-path")
+
+    separation = parser.add_argument_group("Separation options")
+    separation.add_argument("--num-steps", type=int)
+    separation.add_argument("--chunk-seconds", type=float)
+    separation.add_argument("--overlap-seconds", type=float)
+
+    loading = parser.add_argument_group("Loading options")
+    loading.add_argument("--version", type=int, help="Checkpoint version, if supported")
+    loading.add_argument("--subfolder", help="Subfolder within the model repo")
+    loading.add_argument(
+        "--model-kwargs", type=_json_object, help="Loader kwargs as JSON"
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    options = vars(parse_args(argv))
+    model_kwargs = options.pop("model_kwargs", {})
+    for name in ("version", "subfolder"):
+        if name in options:
+            model_kwargs[name] = options.pop(name)
+    for name in ("messages", "segments", "prompt_examples"):
+        if name in options:
+            options[name] = json.loads(Path(options[name]).expanduser().read_text())
+    generate_audio(**options, model_kwargs=model_kwargs)
 
 
 if __name__ == "__main__":

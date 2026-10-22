@@ -121,6 +121,7 @@ def test_saved_prompt_survives_registry_restart(
     generated = []
     provider.model_type = "qwen3_tts"
     provider.config = SimpleNamespace(tts_model_type="base")
+    provider.generate_config = {"temperature": 0.85, "repetition_penalty": 1.2}
 
     def create_voice_clone_prompt(ref_audio, ref_text):
         assert threading.current_thread() is not threading.main_thread()
@@ -161,6 +162,10 @@ def test_saved_prompt_survives_registry_restart(
     assert created[0][1] == transcript
     assert all(
         item["voice"] is None and item["ref_audio"] is None for item in generated
+    )
+    assert all(
+        item["temperature"] == 0.85 and item["repetition_penalty"] == 1.2
+        for item in generated
     )
     assert [
         float(item["voice_clone_prompt"]["speaker_embedding"].item())

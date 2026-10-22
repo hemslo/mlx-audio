@@ -214,6 +214,12 @@ class Model(nn.Module):
         if speech_features is None or (cache is not None and cache[0].offset > 0):
             return text_embeds
 
+        # The speech encoder yields float32 features. Merging them as-is promotes
+        # the whole prompt to float32, so the KV cache is float32 and every later
+        # decode step runs the language model in float32 instead of its own
+        # dtype (4-5x slower on bf16 checkpoints). Match the text embeddings.
+        speech_features = speech_features.astype(text_embeds.dtype)
+
         # Insert speech features at masked positions
         if acoustic_input_mask is not None:
             # acoustic_input_mask is [B, L] boolean
@@ -1267,6 +1273,7 @@ class Model(nn.Module):
                 yield chunk_text
             return
 
+        from mlx_audio.lm.generate import StreamingDetokenizer
         from mlx_audio.lm.sample_utils import make_logits_processors, make_sampler
 
         # Preprocess audio
@@ -1295,6 +1302,7 @@ class Model(nn.Module):
             repetition_penalty=repetition_penalty,
             repetition_context_size=repetition_context_size,
         )
+        detokenizer = StreamingDetokenizer(self.tokenizer)
 
         # Stream tokens
         for token, _ in self.stream_generate(
@@ -1307,7 +1315,12 @@ class Model(nn.Module):
             prefill_step_size=prefill_step_size,
             verbose=verbose,
         ):
-            text = self.tokenizer.decode([token])
+            detokenizer.add_token(token)
+            if text := detokenizer.last_segment:
+                yield text
+
+        detokenizer.finalize()
+        if text := detokenizer.last_segment:
             yield text
 
         mx.clear_cache()
