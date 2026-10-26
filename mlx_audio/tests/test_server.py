@@ -426,6 +426,7 @@ def test_tts_speech_with_saved_qwen_voice_reuses_cached_speaker_prompt(
     }
     mock_tts_model = MagicMock()
     mock_tts_model.model_type = "qwen3_tts"
+    mock_tts_model.voice_cache_identity = "test-checkpoint"
     mock_tts_model.config = SimpleNamespace(tts_model_type="base")
     mock_tts_model.sample_rate = sample_rate
     mock_tts_model.create_voice_clone_prompt = MagicMock(return_value=prompt)
@@ -494,6 +495,7 @@ def test_tts_speech_with_saved_qwen_voice_uses_uploaded_ref_text(
     }
     mock_tts_model = MagicMock()
     mock_tts_model.model_type = "qwen3_tts"
+    mock_tts_model.voice_cache_identity = "test-checkpoint"
     mock_tts_model.config = SimpleNamespace(tts_model_type="base")
     mock_tts_model.sample_rate = sample_rate
     mock_tts_model.create_voice_clone_prompt = MagicMock(return_value=prompt)
@@ -554,6 +556,7 @@ def test_tts_speech_with_saved_voice_string_name_lookup(
     }
     mock_tts_model = MagicMock()
     mock_tts_model.model_type = "qwen3_tts"
+    mock_tts_model.voice_cache_identity = "test-checkpoint"
     mock_tts_model.config = SimpleNamespace(tts_model_type="base")
     mock_tts_model.sample_rate = sample_rate
     mock_tts_model.create_voice_clone_prompt = MagicMock(return_value=prompt)

@@ -2,7 +2,9 @@ import hashlib
 import json
 import os
 import shutil
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -10,9 +12,35 @@ import mlx.core as mx
 import numpy as np
 
 VOICE_SAMPLE_MAX_BYTES = 10 * 1024 * 1024
-# Version 2 rebuilds reference text IDs with Qwen's corrected tokenizer regex.
+# Version 3 adds model and reference fingerprints plus artifact validation.
 # Uploaded recordings and voice metadata are unaffected.
-VOICE_CACHE_SCHEMA_VERSION = 2
+VOICE_CACHE_SCHEMA_VERSION = 3
+
+
+def model_cache_identity(model_path: Path) -> str:
+    """Fingerprint the loaded snapshot, tokenizer/config contents and weight files.
+
+    Weight metadata avoids rereading gigabytes on every model load. Snapshot
+    paths distinguish HF revisions; local weight replacements change stat data.
+    """
+    root = Path(model_path).resolve()
+    digest = hashlib.sha256(str(root).encode())
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix not in {".json", ".txt", ".model", ".safetensors"}:
+            continue
+        digest.update(str(path.relative_to(root)).encode())
+        if path.suffix == ".safetensors":
+            stat = path.stat()
+            digest.update(
+                str((stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)).encode()
+            )
+        else:
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 SUPPORTED_VOICE_SAMPLE_MIME_TYPES = {
     "audio/mpeg": ".mp3",
     "audio/wav": ".wav",
@@ -132,7 +160,7 @@ class VoiceRegistry:
         return cache_dir / f"{model_hash}.npz"
 
     def load_prompt_cache(
-        self, voice_id: str, model_name: str
+        self, voice_id: str, model_name: str, *, model_identity: str = ""
     ) -> Optional[Dict[str, mx.array]]:
         cache_path = self.get_prompt_cache_path(voice_id, model_name)
         if not cache_path.exists():
@@ -143,28 +171,69 @@ class VoiceRegistry:
                 schema_version = int(np.array(data["schema_version"]).reshape(-1)[0])
                 if schema_version != VOICE_CACHE_SCHEMA_VERSION:
                     return None
+                if str(data["identity"].item()) != self._prompt_identity(
+                    voice_id, model_identity
+                ):
+                    return None
 
-                prompt = {}
-                if "ref_codes" in data.files:
-                    prompt["ref_codes"] = mx.array(data["ref_codes"])
-                if "ref_text_ids" in data.files:
-                    prompt["ref_text_ids"] = mx.array(data["ref_text_ids"])
-                if "speaker_embedding" in data.files:
-                    prompt["speaker_embedding"] = mx.array(data["speaker_embedding"])
-                return prompt or None
-        except (KeyError, OSError, ValueError):
+                prompt = {
+                    key: data[key]
+                    for key in ("speaker_embedding", "ref_codes", "ref_text_ids")
+                    if key in data.files
+                }
+                if not self._valid_prompt(voice_id, prompt):
+                    return None
+                return {key: mx.array(value) for key, value in prompt.items()}
+        except (KeyError, OSError, ValueError, EOFError, zipfile.BadZipFile):
             return None
+
+    def _prompt_identity(self, voice_id: str, model_identity: str) -> str:
+        metadata = self.get_voice(voice_id)
+        digest = hashlib.sha256(model_identity.encode())
+        digest.update((metadata.get("transcript") or "").strip().encode())
+        digest.update(self.get_audio_sample_path(voice_id).read_bytes())
+        return digest.hexdigest()
+
+    def _valid_prompt(self, voice_id: str, prompt: dict) -> bool:
+        embedding = prompt.get("speaker_embedding")
+        if (
+            embedding is None
+            or embedding.ndim not in (1, 2)
+            or not embedding.size
+            or (embedding.ndim == 2 and embedding.shape[0] != 1)
+            or embedding.dtype.kind != "f"
+            or not np.isfinite(embedding).all()
+        ):
+            return False
+        has_text = bool((self.get_voice(voice_id).get("transcript") or "").strip())
+        if not has_text:
+            return "ref_codes" not in prompt and "ref_text_ids" not in prompt
+        for key, ndim in (("ref_codes", 3), ("ref_text_ids", 2)):
+            value = prompt.get(key)
+            if (
+                value is None
+                or value.ndim != ndim
+                or value.shape[0] != 1
+                or not value.size
+                or value.dtype.kind not in "iu"
+                or (value < 0).any()
+            ):
+                return False
+        return True
 
     def store_prompt_cache(
         self,
         voice_id: str,
         model_name: str,
         prompt: Dict[str, mx.array],
+        *,
+        model_identity: str = "",
     ) -> Path:
         cache_path = self.get_prompt_cache_path(voice_id, model_name)
         arrays = {
             "schema_version": np.array([VOICE_CACHE_SCHEMA_VERSION], dtype=np.int32)
         }
+        arrays["identity"] = np.array(self._prompt_identity(voice_id, model_identity))
         if "ref_codes" in prompt and prompt["ref_codes"] is not None:
             arrays["ref_codes"] = np.array(prompt["ref_codes"])
         if "ref_text_ids" in prompt and prompt["ref_text_ids"] is not None:
@@ -172,7 +241,18 @@ class VoiceRegistry:
         if "speaker_embedding" in prompt and prompt["speaker_embedding"] is not None:
             arrays["speaker_embedding"] = np.array(prompt["speaker_embedding"])
 
-        np.savez_compressed(cache_path, **arrays)
+        if not self._valid_prompt(voice_id, arrays):
+            raise ValueError("Invalid voice clone prompt artifacts")
+        # Readers see either the previous complete cache or the new complete one.
+        with tempfile.NamedTemporaryFile(
+            dir=cache_path.parent, suffix=".npz", delete=False
+        ) as f:
+            temporary = Path(f.name)
+        try:
+            np.savez_compressed(temporary, **arrays)
+            os.replace(temporary, cache_path)
+        finally:
+            temporary.unlink(missing_ok=True)
         return cache_path
 
     def delete_voice(self, reference: str) -> Dict[str, Any]:

@@ -525,6 +525,18 @@ class TestQwen3TTSSpeakerEmbeddingDtype(unittest.TestCase):
                 np.array(expected.astype(mx.float32)),
             )
 
+    def test_same_length_and_sum_recordings_do_not_share_codes(self):
+        model = _make_dtype_test_model()
+        first = mx.array([0.0, 1.0, -1.0, 0.0])
+        second = mx.array([1.0, 0.0, 0.0, -1.0])
+        with patch.object(
+            model.speech_tokenizer, "encode", wraps=model.speech_tokenizer.encode
+        ) as encode:
+            model.create_voice_clone_prompt(first, "same transcript")
+            model.create_voice_clone_prompt(second, "same transcript")
+            model.create_voice_clone_prompt(first, "same transcript")
+            self.assertEqual(encode.call_count, 2)
+
     def test_cached_speaker_embedding_does_not_reextract_reference(self):
         model = _make_dtype_test_model()
         audio = mx.zeros((2400,), dtype=mx.float32)
@@ -1083,3 +1095,50 @@ class TestDecoderBlockUpsampleStreaming(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSavedVoiceStreamingState(unittest.TestCase):
+    def make_stream(self):
+        model = _make_generation_test_model()
+        calls, resets = [], []
+
+        def step(codes):
+            calls.append(codes.tolist())
+            return mx.ones((1, 1, codes.shape[2] * 1920))
+
+        model.speech_tokenizer.decoder = SimpleNamespace(
+            reset_streaming_state=lambda: resets.append(True), streaming_step=step
+        )
+        stream = model._generate_icl(
+            text="hello",
+            ref_audio=mx.zeros((24,)),
+            ref_text="reference",
+            stream=True,
+            streaming_interval=0.08,
+            max_tokens=3,
+        )
+        return model, stream, calls, resets
+
+    def test_reference_is_consumed_but_not_emitted(self):
+        _, stream, calls, resets = self.make_stream()
+        results = list(stream)
+        self.assertEqual(calls[0], [[[0]]])  # reference prefix
+        self.assertEqual(len(calls), 4)  # reference + three generated frames
+        self.assertEqual(sum(r.samples for r in results), 3 * 1920)
+        self.assertGreaterEqual(len(resets), 2)
+
+    def test_close_and_failure_clear_decoder_state(self):
+        for fail in (False, True):
+            model, stream, calls, resets = self.make_stream()
+            next(stream)
+            if fail:
+
+                def broken(*args, **kwargs):
+                    raise ValueError("generation failed")
+
+                model._sample_token = broken
+                with self.assertRaisesRegex(ValueError, "generation failed"):
+                    next(stream)
+            else:
+                stream.close()
+            self.assertEqual(len(resets), 2)

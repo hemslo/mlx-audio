@@ -1017,8 +1017,9 @@ def _resolve_saved_voice(
     voice_clone_prompt = None
 
     if _supports_qwen3_voice_clone_cache(model):
+        model_identity = getattr(model, "voice_cache_identity", "")
         voice_clone_prompt = voice_registry.load_prompt_cache(
-            custom_voice_id, payload.model
+            custom_voice_id, payload.model, model_identity=model_identity
         )
         if voice_clone_prompt is None:
             try:
@@ -1032,6 +1033,7 @@ def _resolve_saved_voice(
                 custom_voice_id,
                 payload.model,
                 voice_clone_prompt,
+                model_identity=model_identity,
             )
         ref_audio = None
 

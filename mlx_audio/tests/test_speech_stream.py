@@ -7,7 +7,7 @@ import threading
 import time
 from types import SimpleNamespace
 
-import httpx
+import httpx2 as httpx
 import numpy as np
 import pytest
 import uvicorn
@@ -29,7 +29,13 @@ def test_old_prompt_cache_is_rebuilt_without_removing_voice(registry):
     assert registry.get_audio_sample_path("old-cache").read_bytes() == b"recording"
     assert registry.get_voice("old-cache")["transcript"] == "Hello"
     registry.store_prompt_cache(
-        "old-cache", "qwen", {"ref_text_ids": mx.array([[3, 4]])}
+        "old-cache",
+        "qwen",
+        {
+            "speaker_embedding": mx.array([[0.5]]),
+            "ref_codes": mx.zeros((1, 2, 3), dtype=mx.int32),
+            "ref_text_ids": mx.array([[3, 4]]),
+        },
     )
     assert registry.load_prompt_cache("old-cache", "qwen")["ref_text_ids"].tolist() == [
         [3, 4]
@@ -480,3 +486,50 @@ async def test_midstream_inference_error_is_not_silently_swallowed():
     with pytest.raises(ValueError, match="generation failed"):
         async for _ in encode_audio_stream(source(), "mp3"):
             pass
+
+
+def test_concurrent_saved_voices_remain_isolated(registry, provider):
+    from concurrent.futures import ThreadPoolExecutor
+    import mlx.core as mx
+
+    provider.model_type = "qwen3_tts"
+    provider.config = SimpleNamespace(tts_model_type="base")
+    for name, level in [("alice", 0.25), ("bob", 0.5)]:
+        registry.create_voice(name, "consent", str(level).encode())
+
+    def create(ref_audio, ref_text):
+        from pathlib import Path
+
+        return {"speaker_embedding": mx.array([[float(Path(ref_audio).read_text())]])}
+
+    def generate(text, voice_clone_prompt, **kwargs):
+        level = float(voice_clone_prompt["speaker_embedding"].item())
+        for _ in range(3):
+            yield SimpleNamespace(
+                audio=np.full(240, level, dtype=np.float32), sample_rate=24000
+            )
+
+    provider.create_voice_clone_prompt = create
+    provider.generate = generate
+    names = ["alice", "bob"] * 4
+    with TestClient(server.app) as client:
+
+        def request(name):
+            response = client.post(
+                "/v1/audio/speech",
+                json={
+                    "model": "fake",
+                    "input": "hello",
+                    "voice": name,
+                    "stream": True,
+                    "response_format": "pcm",
+                },
+            )
+            assert response.status_code == 200
+            expected = 8192 if name == "alice" else 16384
+            samples = np.frombuffer(response.content, dtype="<i2")
+            assert len(samples) == 720
+            assert np.all(samples == expected)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(request, names))
